@@ -1,0 +1,913 @@
+<img src="https://r2cdn.perplexity.ai/pplx-full-logo-primary-dark%402x.png" class="logo" width="120"/>
+
+# Enhanced PRD: GitHub Copilot Integration for Stagewise
+
+## Executive Summary
+
+**Objective**: Extend stagewise to support GitHub Copilot as a fully-integrated AI agent, enabling users to leverage Copilot's capabilities through stagewise's visual element selection and contextualization features while maintaining the existing architectural patterns.
+
+**Current State**: Stagewise supports Cursor and Windsurf AI agents through diagnostic injection and command triggering via the VS Code Extension Core.
+
+**Target State**: Add GitHub Copilot as a third supported AI agent with seamless integration into the existing stagewise workflow, following the established patterns for AI agent interaction.
+
+## Detailed Architecture Analysis
+
+### Current AI Agent Architecture
+
+Based on the codebase analysis, stagewise uses a sophisticated multi-layer approach:
+
+1. **VS Code Extension Core** (`apps/vscode-extension/src/activation/activate.ts`)
+    - Hosts local web server on dynamically allocated port
+    - Registers SRPC bridge for browser communication
+    - Implements `triggerAgentPrompt` handler that dispatches to appropriate AI agent
+2. **Agent Dispatch System** (`apps/vscode-extension/src/utils/dispatch-agent-call.ts`)
+    - Uses `getCurrentIDE()` to detect active AI environment
+    - Routes requests to specific agent handlers based on IDE detection
+    - Currently supports: `'CURSOR'`, `'WINDSURF'`, `'VSCODE'` (limited)
+3. **Agent-Specific Handlers**
+    - **Cursor**: `callCursorAgent()` - Uses diagnostic injection with `composer.fixerrormessage`
+    - **Windsurf**: `callWindsurfAgent()` - Uses diagnostic injection with `windsurf.prioritized.explainProblem`
+4. **Diagnostic Injection Pattern** (`inject-prompt-diagnostic-with-callback.ts`)
+    - Creates fake VS Code diagnostics containing AI prompts
+    - Triggers AI-specific commands to process these "errors"
+    - Cleans up diagnostics after command execution
+
+## Technical Requirements (Detailed)
+
+### 1. GitHub Copilot API Research \& Discovery
+
+#### Phase 1A: Command Investigation (2-3 days)
+
+- **Investigate Available Commands**:
+
+```typescript
+// Research these VS Code commands for Copilot integration:
+const copilotCommands = [
+  'github.copilot.generate',           // Inline code generation
+  'github.copilot.chat.newChat',       // Start new chat session
+  'github.copilot.chat.sendMessage',   // Send message to chat
+  'github.copilot.explainThis',        // Explain selected code
+  'github.copilot.fixThis',            // Fix selected code
+  'github.copilot.generateThis',       // Generate code for selection
+  'vscode.executeWorkspaceSymbol',     // For context gathering
+];
+```
+
+- **Test Command Behavior**:
+
+```bash
+# Create test scripts to execute each command
+# Document input parameters, return values, and side effects
+# Test with different context types (selection, file, workspace)
+```
+
+
+#### Phase 1B: Extension API Analysis (1-2 days)
+
+- **Study Copilot Extension Structure**:
+
+```typescript
+// Investigate if Copilot exposes programmatic APIs
+const copilotExtension = vscode.extensions.getExtension('github.copilot');
+if (copilotExtension?.exports) {
+  // Document available exported functions
+  // Test API stability and authentication requirements
+}
+```
+
+- **Chat Integration Research**:
+
+```typescript
+// Investigate VS Code Chat API (if available)
+// Test integration with vscode.chat namespace
+// Document authentication and session management
+```
+
+
+### 2. IDE Detection Enhancement
+
+#### File: `apps/vscode-extension/src/utils/get-current-ide.ts`
+
+**Current Implementation Pattern**:
+
+```typescript
+export function getCurrentIDE(): 'CURSOR' | 'WINDSURF' | 'VSCODE' | 'UNKNOWN' {
+  // Existing detection logic for Cursor/Windsurf
+}
+```
+
+**Enhanced Implementation**:
+
+```typescript
+export type SupportedIDE = 'CURSOR' | 'WINDSURF' | 'GITHUB_COPILOT' | 'VSCODE' | 'UNKNOWN';
+
+export function getCurrentIDE(): SupportedIDE {
+  try {
+    // Check for GitHub Copilot (Priority: High)
+    const copilotExtension = vscode.extensions.getExtension('github.copilot');
+    const copilotChatExtension = vscode.extensions.getExtension('github.copilot-chat');
+    
+    if (copilotExtension?.isActive || copilotChatExtension?.isActive) {
+      // Verify Copilot is authenticated and functional
+      if (isCopilotAuthenticated()) {
+        return 'GITHUB_COPILOT';
+      }
+    }
+
+    // Existing Cursor detection logic
+    const cursorExtensions = [
+      'cursor.cursor-ai',
+      'cursor.composer'
+    ];
+    if (cursorExtensions.some(id => vscode.extensions.getExtension(id)?.isActive)) {
+      return 'CURSOR';
+    }
+
+    // Existing Windsurf detection logic
+    const windsurfExtensions = [
+      'windsurf.windsurf-ai',
+      'windsurf.codegeneration'
+    ];
+    if (windsurfExtensions.some(id => vscode.extensions.getExtension(id)?.isActive)) {
+      return 'WINDSURF';
+    }
+
+    return 'VSCODE';
+  } catch (error) {
+    console.error('Error detecting IDE:', error);
+    return 'UNKNOWN';
+  }
+}
+
+async function isCopilotAuthenticated(): Promise<boolean> {
+  try {
+    // Test Copilot authentication status
+    const result = await vscode.commands.executeCommand('github.copilot.auth.checkStatus');
+    return result === 'authenticated';
+  } catch {
+    return false;
+  }
+}
+```
+
+
+### 3. GitHub Copilot Agent Handler Implementation
+
+#### File: `apps/vscode-extension/src/utils/call-github-copilot-agent.ts` (new)
+
+**Three Implementation Strategies**:
+
+##### Strategy A: Chat Integration (Preferred)
+
+```typescript
+import * as vscode from 'vscode';
+import { injectPromptDiagnosticWithCallback } from './inject-prompt-diagnostic-with-callback';
+
+const COPILOT_PROMPT_PREFIX = `
+🎯 Stagewise Context Request:
+The user has selected specific UI elements in their browser and wants to make code changes.
+Please analyze the provided DOM context and implement the requested changes.
+
+Context Details:
+`;
+
+export async function callGitHubCopilotAgent(request: {
+  prompt: string;
+  model?: string;
+}): Promise<void> {
+  const promptWithPrefix = `${COPILOT_PROMPT_PREFIX}\n${request.prompt}`;
+  
+  try {
+    // Strategy A1: Direct Chat API (if available)
+    if (await isChatAPIAvailable()) {
+      await sendChatMessage(promptWithPrefix);
+      return;
+    }
+
+    // Strategy A2: Chat Command Integration
+    if (await isChatCommandAvailable()) {
+      await initiateChatWithPrompt(promptWithPrefix);
+      return;
+    }
+
+    // Strategy A3: Fallback to diagnostic injection
+    await injectPromptDiagnosticWithCallback({
+      prompt: promptWithPrefix,
+      callback: () => vscode.commands.executeCommand('github.copilot.chat.newChat')
+    });
+
+  } catch (error) {
+    vscode.window.showErrorMessage(`GitHub Copilot integration failed: ${error.message}`);
+    throw error;
+  }
+}
+
+async function isChatAPIAvailable(): Promise<boolean> {
+  try {
+    // Check if VS Code Chat API is available and Copilot supports it
+    return typeof vscode.chat !== 'undefined' && 
+           await vscode.commands.getCommands().then(cmds => 
+             cmds.includes('github.copilot.chat.sendMessage')
+           );
+  } catch {
+    return false;
+  }
+}
+
+async function sendChatMessage(prompt: string): Promise<void> {
+  try {
+    // Use VS Code Chat API if available
+    await vscode.commands.executeCommand('github.copilot.chat.sendMessage', {
+      message: prompt,
+      location: 'panel'
+    });
+  } catch (error) {
+    throw new Error(`Chat API failed: ${error.message}`);
+  }
+}
+
+async function isChatCommandAvailable(): Promise<boolean> {
+  const commands = await vscode.commands.getCommands();
+  return commands.includes('github.copilot.chat.newChat');
+}
+
+async function initiateChatWithPrompt(prompt: string): Promise<void> {
+  try {
+    // Open Copilot chat and send prompt
+    await vscode.commands.executeCommand('github.copilot.chat.newChat');
+    
+    // Wait for chat to initialize
+    await new Promise(resolve => setTimeout(resolve, 500));
+    
+    // Send the prompt (method depends on Copilot's API)
+    await vscode.commands.executeCommand('github.copilot.chat.sendMessage', prompt);
+  } catch (error) {
+    throw new Error(`Chat command failed: ${error.message}`);
+  }
+}
+```
+
+
+##### Strategy B: Inline Generation
+
+```typescript
+async function callCopilotInlineGeneration(request: {
+  prompt: string;
+  context?: string;
+}): Promise<void> {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor) {
+    throw new Error('No active editor for Copilot generation');
+  }
+
+  try {
+    // Position cursor at relevant location
+    const selection = editor.selection;
+    
+    // Trigger inline generation with context
+    await vscode.commands.executeCommand('github.copilot.generate', {
+      textDocument: editor.document,
+      position: selection.start,
+      context: {
+        prefix: request.context || '',
+        suffix: request.prompt,
+        language: editor.document.languageId
+      }
+    });
+  } catch (error) {
+    throw new Error(`Inline generation failed: ${error.message}`);
+  }
+}
+```
+
+
+##### Strategy C: Diagnostic Injection (Fallback)
+
+```typescript
+async function callCopilotDiagnosticFallback(request: {
+  prompt: string;
+}): Promise<void> {
+  const copilotPromptPrefix = `
+GitHub Copilot: This isn't actually an error - it's a code change request from stagewise.
+Please implement the following request based on the provided context:
+
+`;
+  
+  await injectPromptDiagnosticWithCallback({
+    prompt: `${copilotPromptPrefix}\n${request.prompt}`,
+    callback: async () => {
+      // Try multiple Copilot commands in order of preference
+      const copilotCommands = [
+        'github.copilot.explainThis',
+        'github.copilot.fixThis',
+        'github.copilot.generateThis',
+        'github.copilot.chat.newChat'
+      ];
+      
+      for (const command of copilotCommands) {
+        try {
+          await vscode.commands.executeCommand(command);
+          break; // Success, exit loop
+        } catch (error) {
+          console.warn(`Copilot command ${command} failed:`, error);
+          // Continue to next command
+        }
+      }
+    }
+  });
+}
+```
+
+
+### 4. Enhanced Dispatcher Integration
+
+#### File: `apps/vscode-extension/src/utils/dispatch-agent-call.ts`
+
+**Enhanced Implementation**:
+
+```typescript
+import { getCurrentIDE } from './get-current-ide';
+import { callCursorAgent } from './call-cursor-agent';
+import { callWindsurfAgent } from './call-windsurf-agent';
+import { callGitHubCopilotAgent } from './call-github-copilot-agent';
+import * as vscode from 'vscode';
+
+export async function dispatchAgentCall(request: {
+  prompt: string;
+  model?: string;
+  context?: any;
+}): Promise<void> {
+  const ide = getCurrentIDE();
+  
+  console.log(`Dispatching to ${ide} with prompt length: ${request.prompt.length}`);
+  
+  try {
+    switch (ide) {
+      case 'CURSOR':
+        await callCursorAgent(request);
+        break;
+        
+      case 'WINDSURF':
+        await callWindsurfAgent(request);
+        break;
+        
+      case 'GITHUB_COPILOT':
+        await callGitHubCopilotAgent(request);
+        break;
+        
+      case 'VSCODE':
+        // Check if Copilot is available as fallback
+        if (await isCopilotAvailable()) {
+          await callGitHubCopilotAgent(request);
+        } else {
+          vscode.window.showErrorMessage(
+            'No supported AI agent found. Please install Cursor, Windsurf, or GitHub Copilot.'
+          );
+        }
+        break;
+        
+      default:
+        vscode.window.showErrorMessage(
+          `Unsupported IDE: ${ide}. Supported: Cursor, Windsurf, GitHub Copilot.`
+        );
+    }
+  } catch (error) {
+    vscode.window.showErrorMessage(`AI agent call failed: ${error.message}`);
+    throw error;
+  }
+}
+
+async function isCopilotAvailable(): Promise<boolean> {
+  const copilotExtension = vscode.extensions.getExtension('github.copilot');
+  return copilotExtension?.isActive || false;
+}
+```
+
+
+### 5. Enhanced Error Handling \& User Experience
+
+#### File: `apps/vscode-extension/src/utils/copilot-error-handler.ts` (new)
+
+```typescript
+import * as vscode from 'vscode';
+
+export enum CopilotErrorType {
+  NOT_INSTALLED = 'not_installed',
+  NOT_AUTHENTICATED = 'not_authenticated',
+  API_UNAVAILABLE = 'api_unavailable',
+  NETWORK_ERROR = 'network_error',
+  QUOTA_EXCEEDED = 'quota_exceeded',
+  UNKNOWN = 'unknown'
+}
+
+export class CopilotError extends Error {
+  constructor(
+    public type: CopilotErrorType,
+    message: string,
+    public suggestion?: string
+  ) {
+    super(message);
+    this.name = 'CopilotError';
+  }
+}
+
+export function handleCopilotError(error: any): void {
+  if (error instanceof CopilotError) {
+    const action = error.suggestion ? 'Fix It' : 'OK';
+    
+    vscode.window.showErrorMessage(
+      `GitHub Copilot: ${error.message}`,
+      action
+    ).then(selection => {
+      if (selection === 'Fix It' && error.suggestion) {
+        handleErrorSuggestion(error.type);
+      }
+    });
+  } else {
+    vscode.window.showErrorMessage(`Unexpected Copilot error: ${error.message}`);
+  }
+}
+
+async function handleErrorSuggestion(errorType: CopilotErrorType): Promise<void> {
+  switch (errorType) {
+    case CopilotErrorType.NOT_INSTALLED:
+      vscode.env.openExternal(vscode.Uri.parse(
+        'https://marketplace.visualstudio.com/items?itemName=GitHub.copilot'
+      ));
+      break;
+      
+    case CopilotErrorType.NOT_AUTHENTICATED:
+      await vscode.commands.executeCommand('github.copilot.auth.signIn');
+      break;
+      
+    case CopilotErrorType.API_UNAVAILABLE:
+      vscode.window.showInformationMessage(
+        'Try updating your GitHub Copilot extension to the latest version.'
+      );
+      break;
+  }
+}
+
+export function detectCopilotError(error: any): CopilotError {
+  const message = error.message?.toLowerCase() || '';
+  
+  if (message.includes('not installed') || message.includes('extension not found')) {
+    return new CopilotError(
+      CopilotErrorType.NOT_INSTALLED,
+      'GitHub Copilot extension is not installed',
+      'Install the GitHub Copilot extension from the VS Code marketplace'
+    );
+  }
+  
+  if (message.includes('not authenticated') || message.includes('sign in')) {
+    return new CopilotError(
+      CopilotErrorType.NOT_AUTHENTICATED,
+      'GitHub Copilot is not authenticated',
+      'Sign in to your GitHub account to use Copilot'
+    );
+  }
+  
+  if (message.includes('api') || message.includes('command not found')) {
+    return new CopilotError(
+      CopilotErrorType.API_UNAVAILABLE,
+      'GitHub Copilot API is not available',
+      'Update your Copilot extension or try again later'
+    );
+  }
+  
+  if (message.includes('quota') || message.includes('limit')) {
+    return new CopilotError(
+      CopilotErrorType.QUOTA_EXCEEDED,
+      'GitHub Copilot usage quota exceeded'
+    );
+  }
+  
+  return new CopilotError(CopilotErrorType.UNKNOWN, message);
+}
+```
+
+
+### 6. Enhanced Testing Strategy
+
+#### Unit Tests (`src/test/copilot-integration.test.ts`)
+
+```typescript
+import * as assert from 'assert';
+import * as vscode from 'vscode';
+import { getCurrentIDE } from '../utils/get-current-ide';
+import { callGitHubCopilotAgent } from '../utils/call-github-copilot-agent';
+import { dispatchAgentCall } from '../utils/dispatch-agent-call';
+
+suite('GitHub Copilot Integration Tests', () => {
+  
+  suite('IDE Detection', () => {
+    test('should detect GitHub Copilot when extension is active', async () => {
+      // Mock Copilot extension
+      const mockExtension = {
+        isActive: true,
+        exports: {}
+      };
+      
+      // Test detection logic
+      const ide = getCurrentIDE();
+      assert.strictEqual(ide, 'GITHUB_COPILOT');
+    });
+    
+    test('should fallback to VSCODE when Copilot is installed but not authenticated', async () => {
+      // Test authentication detection
+      // Mock authentication failure
+      // Verify fallback behavior
+    });
+  });
+  
+  suite('Command Integration', () => {
+    test('should execute chat command when available', async () => {
+      const mockRequest = {
+        prompt: 'Test prompt with DOM context',
+        context: '<button id="test">Click me</button>'
+      };
+      
+      // Mock VS Code commands
+      let executedCommands: string[] = [];
+      const originalExecuteCommand = vscode.commands.executeCommand;
+      vscode.commands.executeCommand = async (command: string, ...args: any[]) => {
+        executedCommands.push(command);
+        return Promise.resolve();
+      };
+      
+      await callGitHubCopilotAgent(mockRequest);
+      
+      assert.ok(executedCommands.includes('github.copilot.chat.newChat'));
+      
+      // Restore original function
+      vscode.commands.executeCommand = originalExecuteCommand;
+    });
+  });
+  
+  suite('Error Handling', () => {
+    test('should handle authentication errors gracefully', async () => {
+      // Mock authentication error
+      // Test error detection and user messaging
+      // Verify recovery suggestions
+    });
+    
+    test('should fallback between strategies when primary fails', async () => {
+      // Test strategy fallback chain
+      // Verify all strategies are attempted
+      // Ensure appropriate error propagation
+    });
+  });
+  
+  suite('Integration with Existing Patterns', () => {
+    test('should work with diagnostic injection pattern', async () => {
+      // Test diagnostic injection fallback
+      // Verify cleanup behavior
+      // Test with real prompt context
+    });
+    
+    test('should integrate with SRPC bridge correctly', async () => {
+      // Test full end-to-end flow
+      // Browser -> SRPC -> Extension -> Copilot
+      // Verify response handling
+    });
+  });
+});
+```
+
+
+#### Integration Tests (`src/test/end-to-end.test.ts`)
+
+```typescript
+suite('End-to-End Copilot Integration', () => {
+  let testWorkspace: vscode.WorkspaceFolder;
+  
+  setup(async () => {
+    // Create test workspace with React component
+    testWorkspace = await createTestWorkspace();
+  });
+  
+  test('should handle React component modification request', async () => {
+    const mockDOMContext = `
+      <element index="1">
+        <tag>button</tag>
+        <id>submit-btn</id>
+        <classes>btn btn-primary</classes>
+        <text>Submit Form</text>
+        <computed_styles>
+          <backgroundColor>rgb(0, 123, 255)</backgroundColor>
+          <color>rgb(255, 255, 255)</color>
+        </computed_styles>
+        <react_components>SubmitButton, MyForm</react_components>
+      </element>
+    `;
+    
+    const userPrompt = 'Change this button color to red and add a loading spinner';
+    
+    const fullRequest = {
+      prompt: `
+        <request>
+          <user_goal>${userPrompt}</user_goal>
+          <url>http://localhost:3000/test-page</url>
+          <selected_elements>${mockDOMContext}</selected_elements>
+        </request>
+      `
+    };
+    
+    // Execute dispatch
+    await dispatchAgentCall(fullRequest);
+    
+    // Verify Copilot was called appropriately
+    // Check for expected command executions
+    // Verify no errors were thrown
+  });
+  
+  test('should handle authentication flow', async () => {
+    // Test authentication check
+    // Mock authentication failure and recovery
+    // Verify user guidance
+  });
+});
+```
+
+
+## Implementation Timeline (Detailed)
+
+### Phase 1: Research \& Foundation (3-4 days)
+
+#### Day 1-2: API Research
+
+- **Morning**: Set up development environment with Copilot installed
+- **Afternoon**: Execute and document all available Copilot commands
+- **Evening**: Research VS Code Chat API and extension exports
+
+
+#### Day 3: Architecture Planning
+
+- **Morning**: Design integration strategy based on API findings
+- **Afternoon**: Create detailed technical specifications
+- **Evening**: Set up testing framework and mock environment
+
+
+#### Day 4: Foundation Implementation
+
+- **Morning**: Implement enhanced IDE detection
+- **Afternoon**: Create basic Copilot agent handler structure
+- **Evening**: Implement error handling framework
+
+
+### Phase 2: Core Implementation (4-5 days)
+
+#### Day 5-6: Primary Integration Strategy
+
+- **Morning**: Implement Chat API integration (Strategy A)
+- **Afternoon**: Implement inline generation fallback (Strategy B)
+- **Evening**: Comprehensive testing of primary strategies
+
+
+#### Day 7-8: Fallback Mechanisms
+
+- **Morning**: Implement diagnostic injection fallback (Strategy C)
+- **Afternoon**: Create strategy selection logic and error recovery
+- **Evening**: Integration testing with existing dispatcher
+
+
+#### Day 9: User Experience \& Polish
+
+- **Morning**: Implement user-friendly error messages
+- **Afternoon**: Add configuration options and settings
+- **Evening**: Performance optimization and cleanup
+
+
+### Phase 3: Testing \& Validation (3-4 days)
+
+#### Day 10-11: Comprehensive Testing
+
+- **Morning**: Unit test suite completion
+- **Afternoon**: Integration testing with real Copilot instance
+- **Evening**: Edge case testing and error scenario validation
+
+
+#### Day 12: End-to-End Validation
+
+- **Morning**: Full workflow testing (Browser -> Extension -> Copilot)
+- **Afternoon**: Performance testing and memory leak checks
+- **Evening**: User acceptance testing with real scenarios
+
+
+#### Day 13: Bug Fixes \& Optimization
+
+- **Morning**: Address discovered issues
+- **Afternoon**: Performance improvements
+- **Evening**: Code review and refactoring
+
+
+### Phase 4: Documentation \& Release (2-3 days)
+
+#### Day 14-15: Documentation
+
+- **Morning**: Update user documentation and installation guides
+- **Afternoon**: Create troubleshooting guides
+- **Evening**: Update developer documentation and API references
+
+
+#### Day 16: Release Preparation
+
+- **Morning**: Final testing and validation
+- **Afternoon**: Release notes and version updates
+- **Evening**: Deployment preparation and rollout plan
+
+
+## Success Metrics (Detailed)
+
+### Functional Requirements
+
+1. **Basic Integration**: ✅ Users can send prompts to GitHub Copilot through stagewise
+2. **Context Preservation**: ✅ DOM context is properly transmitted and utilized
+3. **Error Resilience**: ✅ System gracefully handles authentication and API failures
+4. **Performance**: ✅ Response time under 2 seconds for typical requests
+
+### Quality Metrics
+
+1. **Reliability**: 95% success rate for prompt transmission
+2. **User Experience**: Error recovery within 30 seconds for authentication issues
+3. **Compatibility**: Works with Copilot versions from last 6 months
+4. **Documentation**: 100% coverage of installation and troubleshooting scenarios
+
+### Advanced Features (Future Enhancements)
+
+1. **Custom Copilot Prompts**: User-configurable prompt templates
+2. **Multi-file Context**: Extended context beyond single DOM elements
+3. **Suggestion Filtering**: AI response filtering based on element types
+4. **Real-time Collaboration**: Multi-user Copilot sessions through stagewise
+
+## Risk Mitigation (Detailed)
+
+### Technical Risks
+
+1. **API Changes**: GitHub Copilot API instability
+    - **Mitigation**: Multiple fallback strategies, version detection
+    - **Contingency**: Graceful degradation to diagnostic injection
+2. **Authentication Complexity**: Copilot authentication edge cases
+    - **Mitigation**: Comprehensive error detection and user guidance
+    - **Contingency**: Manual authentication instructions and troubleshooting
+3. **Performance Impact**: Copilot integration affecting VS Code performance
+    - **Mitigation**: Asynchronous processing, timeout mechanisms
+    - **Contingency**: Optional feature flags for performance-critical environments
+
+### User Experience Risks
+
+1. **Setup Complexity**: Difficult installation or configuration
+    - **Mitigation**: Automated setup commands, clear documentation
+    - **Contingency**: Step-by-step video guides and community support
+2. **Expectation Mismatch**: Copilot behavior different from Cursor/Windsurf
+    - **Mitigation**: Clear documentation of differences, user education
+    - **Contingency**: Configuration options to adjust behavior
+
+This enhanced PRD provides a comprehensive roadmap for implementing GitHub Copilot support in stagewise while maintaining the high-quality standards and architectural patterns established by the existing codebase.
+
+<div style="text-align: center">⁂</div>
+
+[^1]: 01_vs_code_extension_core.md
+
+[^2]: 02_toolbar_core__browser_companion.md
+
+[^3]: 03_srpc__strongly_typed_rpc__communication_layer.md
+
+[^4]: 04_dom_contextualization.md
+
+[^5]: 05_ai_agent_interaction___prompting.md
+
+[^6]: 06_toolbar_plugin_system.md
+
+[^7]: 07_framework_integration_packages.md
+
+[^8]: index.md
+
+[^9]: https://arxiv.org/pdf/2209.09729.pdf
+
+[^10]: https://www.stat.berkeley.edu/~ryantibs/papers/stagewise.pdf
+
+[^11]: https://marketplace.visualstudio.com/items?itemName=stagewise.stagewise-vscode-extension
+
+[^12]: https://stagewise.io/docs/quickstart
+
+[^13]: https://arxiv.org/html/2501.13282
+
+[^14]: https://learn.microsoft.com/en-us/visualstudio/ide/copilot-agent-mode?view=vs-2022
+
+[^15]: https://github.com/stagewise-io/stagewise/blob/main/README.md
+
+[^16]: https://arxiv.org/pdf/1209.1327.pdf
+
+[^17]: https://github.blog/ai-and-ml/github-copilot/from-prompt-to-production-building-a-landing-page-with-copilot-agent-mode/
+
+[^18]: https://arxiv.org/pdf/2408.05829.pdf
+
+[^19]: https://www.techtarget.com/whatis/definition/codebase-code-base
+
+[^20]: https://www.semanticscholar.org/paper/560316389d5223e5cf1362902f4bd42b87f607e6
+
+[^21]: https://www.semanticscholar.org/paper/90bfdfcd50e7dded442dca8005b212d7e7d073e9
+
+[^22]: https://dev.to/biswasprasana001/a-beginners-guide-to-understanding-a-codebase-4i73
+
+[^23]: https://yoan-thirion.gitbook.io/knowledge-base/software-architecture/fundamentals-of-software-architecture
+
+[^24]: https://www.index.dev/blog/software-architecture-patterns-guide
+
+[^25]: https://www.finalroundai.com/interview-questions/system-design-git-goldman
+
+[^26]: https://www.reddit.com/r/learnprogramming/comments/jy7zff/how_do_you_plan_a_big_project_code_wise/
+
+[^27]: https://pubmed.ncbi.nlm.nih.gov/39271105/
+
+[^28]: https://www.semanticscholar.org/paper/8aebedca9f675f8fe781b460d1a3b425bce5b956
+
+[^29]: https://www.semanticscholar.org/paper/dfbd482423de2e32656637769ed53ca19c30feb8
+
+[^30]: https://crowdbotics.com/posts/blog/how-the-crowdbotics-github-copilot-extension-delivers-more-accurate-code-with-prd-driven-context/
+
+[^31]: https://docs.github.com/en/copilot/about-github-copilot/github-copilot-features
+
+[^32]: https://www.thoughtworks.com/en-in/insights/blog/generative-ai/experiment-github-copilot-practical-guide
+
+[^33]: https://www.cognizant.com/en_us/services/documents/github-copilot-harnessing-the-power-of-ai-for-quality-engineering.pdf
+
+[^34]: http://crowdbotics.com/posts/blog/unlocking-productivity-how-teaming-up-ai-tools-supercharges-github-copilot/
+
+[^35]: https://www.semanticscholar.org/paper/e7878088f8fcfdb2cb833b3fa76e9e51ce647e2c
+
+[^36]: https://www.semanticscholar.org/paper/e55c573fc785135f1b7eccfb0548fa5df4a74481
+
+[^37]: https://www.semanticscholar.org/paper/21282a2e919c478b9dff54304a687164b686a937
+
+[^38]: https://www.semanticscholar.org/paper/d265bcd6919efe87ebaffc57f719720331391a32
+
+[^39]: https://www.semanticscholar.org/paper/233435ef64113c42bda7bbc43cf1c8b43c887ed0
+
+[^40]: https://www.semanticscholar.org/paper/dc8f4c9f0ec0f653fceb48ccda3f8a3a7c153d04
+
+[^41]: https://pubmed.ncbi.nlm.nih.gov/28540779/
+
+[^42]: https://www.semanticscholar.org/paper/cfb92bb0f2de066c5d36e67e45495cf7f05e31f2
+
+[^43]: https://www.semanticscholar.org/paper/455f88bbdd254e2352c9d3f077f36d1fd08eeae2
+
+[^44]: https://www.semanticscholar.org/paper/ce5a661b768249440741dea13d7a88ef2af4c55e
+
+[^45]: https://github.com/microsoft/vscode-extension-samples
+
+[^46]: https://code.visualstudio.com/api/extension-guides/overview
+
+[^47]: https://www.youtube.com/watch?v=bBTgcO6CKv0
+
+[^48]: https://arxiv.org/pdf/2006.04975.pdf
+
+[^49]: https://www.cs.uoi.gr/~pitoura/courses/ds04_gr/communication-part1.pdf
+
+[^50]: https://tcall.tamu.edu/docs/ContextualizatingAdultEdInstructionCareerPathways.pdf
+
+[^51]: https://stagewise.io
+
+[^52]: https://arxiv.org/pdf/2410.22129.pdf
+
+[^53]: https://arxiv.org/pdf/2502.13199.pdf
+
+[^54]: https://arxiv.org/pdf/2406.17910.pdf
+
+[^55]: https://arxiv.org/pdf/2205.06537.pdf
+
+[^56]: https://arxiv.org/pdf/2306.04930.pdf
+
+[^57]: https://arxiv.org/pdf/2111.07875.pdf
+
+[^58]: https://arxiv.org/pdf/1909.00642.pdf
+
+[^59]: https://arxiv.org/pdf/2206.12839.pdf
+
+[^60]: https://arxiv.org/pdf/2206.15000.pdf
+
+[^61]: https://github.com/deepak2233/prd-automation-pipeline
+
+[^62]: https://docs.github.com/en/copilot/managing-copilot/configure-personal-settings/installing-the-github-copilot-extension-in-your-environment
+
+[^63]: https://www.youtube.com/watch?v=0Oz-WQi51aU
+
+[^64]: https://www.youtube.com/watch?v=YI7kjWzIiTM
+
+[^65]: https://arxiv.org/pdf/2206.06428.pdf
+
+[^66]: https://arxiv.org/pdf/2503.09673.pdf
+
+[^67]: https://pmc.ncbi.nlm.nih.gov/articles/PMC11627126/
+
+[^68]: https://www.youtube.com/watch?v=cHQo26fdx_o
+
+[^69]: https://github.com/sogou/srpc/wiki
+
+[^70]: https://citeseerx.ist.psu.edu/document?repid=rep1\&type=pdf\&doi=4f77341f99376290f21eeccd148d544ae2757b0b
+
+[^71]: https://www.youtube.com/watch?v=_Udb5NC6vTI
+
+[^72]: https://www.paperdigest.org/data/neurips-2023-full.html
+
